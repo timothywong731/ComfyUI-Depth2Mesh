@@ -55,6 +55,7 @@ def test_depth2mesh_with_transparency_validation():
 
     # Assert
     assert isinstance(mesh, trimesh.Trimesh)
+    # Note: depends on networkx for repair if not watertight by default
     assert mesh.is_watertight
 
     # Check bounds roughly
@@ -64,6 +65,32 @@ def test_depth2mesh_with_transparency_validation():
     assert np.isclose(bounds[0][2], 0.0, atol=1e-5)
     # z max should be <= 5.0
     assert bounds[1][2] <= 5.0 + 1e-5
+
+
+def test_depth2mesh_power_transformation():
+    """Verifies that the power parameter affects the height distribution."""
+    # Create a 10x10 gradient image
+    data = np.zeros((10, 10, 4), dtype=np.uint8)
+    data[:, :, 3] = 255
+    for i in range(10):
+        data[:, i, :3] = int((i / 9.0) * 255)
+    img = Image.fromarray(data)
+
+    # Act
+    mesh_linear = depth2mesh(img, 10, 10, 10, power=1.0)
+    mesh_power = depth2mesh(img, 10, 10, 10, power=2.0)
+
+    # Assert
+    # Power > 1 should result in lower average height for a linear gradient [0,1]^2 < [0,1]
+    assert np.mean(mesh_power.vertices[:, 2]) < np.mean(mesh_linear.vertices[:, 2])
+
+
+def test_depth2mesh_small_image():
+    """Tests that the function handles a minimal 2x2 image."""
+    img = Image.new("RGBA", (2, 2), (255, 255, 255, 255))
+    mesh = depth2mesh(img, 10, 10, 5)
+    assert len(mesh.vertices) > 0
+    assert mesh.is_watertight
 
 
 def test_depth2mesh_all_transparent_raises_error():
@@ -95,3 +122,26 @@ def test_depth2mesh_input_path(tmp_path):
 
     # Assert
     assert isinstance(mesh, trimesh.Trimesh)
+    assert mesh.is_watertight
+
+
+def test_depth2mesh_donut_shape():
+    """Tests an image with an internal hole (alpha=0 in the middle)."""
+    # Create 20x20 image, opaque square with 6x6 transparent hole in middle
+    data = np.zeros((20, 20, 4), dtype=np.uint8)
+    data[:, :, :3] = 200  # grey
+    data[:, :, 3] = 255  # opaque
+
+    # Cut hole
+    data[7:13, 7:13, 3] = 0
+
+    img = Image.fromarray(data)
+
+    # Act
+    mesh = depth2mesh(img, 20, 20, 5)
+
+    # Assert
+    assert isinstance(mesh, trimesh.Trimesh)
+    assert mesh.is_watertight
+    # Should have internal walls now
+    assert len(mesh.faces) > 500  # Roughly

@@ -115,11 +115,11 @@ def depth2mesh(image_input, mesh_width_mm, mesh_height_mm, mesh_depth_mm, power=
                 v2 = index_map[idx_down]
                 v3 = index_map[idx_diag]
 
-                # Add two triangles for the quad
-                # Triangle 1: Top-Left -> Top-Right -> Bottom-Left
-                # Triangle 2: Top-Right -> Bottom-Right -> Bottom-Left
-                faces.append([v0, v1, v2])
-                faces.append([v1, v3, v2])
+                # Add two triangles for the quad (Counter-Clockwise winding for +Z normal)
+                # Triangle 1: Top-Left -> Bottom-Left -> Top-Right
+                # Triangle 2: Top-Right -> Bottom-Left -> Bottom-Right
+                faces.append([v0, v2, v1])
+                faces.append([v1, v2, v3])
 
     if len(faces) == 0:
         raise ValueError(
@@ -143,20 +143,23 @@ def depth2mesh(image_input, mesh_width_mm, mesh_height_mm, mesh_depth_mm, power=
 
     # Step 9: Find boundary edges manually
     def find_boundary_edges(faces):
-        # Count how many times each edge is shared by a face.
-        # Edges shared by 2 faces are internal; edges with count 1 are boundaries.
-        edge_count = defaultdict(int)
+        # Create a list of all directed edges in the top mesh
+        directed_edges = []
         for face in faces:
-            # Each face has three edges
-            edges = [
-                tuple(sorted([face[0], face[1]])),
-                tuple(sorted([face[1], face[2]])),
-                tuple(sorted([face[2], face[0]])),
-            ]
-            for edge in edges:
-                edge_count[edge] += 1
-        # Boundary edges are those that appear only once
-        boundary_edges = [edge for edge, count in edge_count.items() if count == 1]
+            directed_edges.extend(
+                [(face[0], face[1]), (face[1], face[2]), (face[2], face[0])]
+            )
+
+        # Count occurrences of geometric edges (ignoring direction)
+        edge_count = defaultdict(int)
+        for edge in directed_edges:
+            edge_count[tuple(sorted(edge))] += 1
+
+        # Boundary edges are those that appear only once geometrically.
+        # We preserve their original direction from the face winding.
+        boundary_edges = [
+            edge for edge in directed_edges if edge_count[tuple(sorted(edge))] == 1
+        ]
         return boundary_edges
 
     boundary_edges = find_boundary_edges(top_mesh.faces)
@@ -179,45 +182,64 @@ def depth2mesh(image_input, mesh_width_mm, mesh_height_mm, mesh_depth_mm, power=
         v1_bottom_coord = bottom_mesh.vertices[v1_top]
 
         # Define vertices for the wall quad
+        # The quad order is v0_top -> v1_top -> v1_bottom -> v0_bottom
+        # which satisfies CCW winding facing outwards.
         wall_vertices = np.array(
             [v0_top_coord, v1_top_coord, v1_bottom_coord, v0_bottom_coord]
         )
 
-        # Define two faces for the wall (2 triangles)
-        wall_faces = np.array([[0, 1, 2], [0, 2, 3]])
+        # Define two triangles for the wall quad.
+        # Skip degenerate triangles if top and bottom vertices coincide (z=0).
+        wall_faces = []
+        if not (
+            np.allclose(v0_top_coord, v1_top_coord)
+            or np.allclose(v1_top_coord, v1_bottom_coord)
+            or np.allclose(v1_bottom_coord, v0_top_coord)
+        ):
+            wall_faces.append([0, 1, 2])
 
-        # Create wall mesh
-        wall = trimesh.Trimesh(vertices=wall_vertices, faces=wall_faces, process=False)
+        if not (
+            np.allclose(v0_top_coord, v1_bottom_coord)
+            or np.allclose(v1_bottom_coord, v0_bottom_coord)
+            or np.allclose(v0_bottom_coord, v0_top_coord)
+        ):
+            wall_faces.append([0, 2, 3])
 
-        wall_meshes.append(wall)
+        if wall_faces:
+            wall = trimesh.Trimesh(
+                vertices=wall_vertices, faces=wall_faces, process=False
+            )
+            wall_meshes.append(wall)
 
     # Step 11: Concatenate all meshes
     meshes = [top_mesh, bottom_mesh] + wall_meshes
     combined_mesh = trimesh.util.concatenate(meshes)
 
-    # Step 12: Debugging - Check vertex and face counts
-    max_face_index = combined_mesh.faces.max()
-    num_vertices = len(combined_mesh.vertices)
-    print(f"Total vertices: {num_vertices}")
-    print(f"Total faces: {len(combined_mesh.faces)}")
-    print(f"Max face index: {max_face_index}")
+    # Step 12: Consolidate geometry
+    # Merge vertices that are at the same location to connect the disparate parts.
+    combined_mesh.merge_vertices()
 
-    if max_face_index >= num_vertices:
-        raise IndexError(
-            f"Face index {max_face_index} out of bounds for vertices with size {num_vertices}."
-        )
+    # Remove any degenerate or duplicate faces.
+    combined_mesh.update_faces(combined_mesh.nondegenerate_faces())
+    combined_mesh.update_faces(combined_mesh.unique_faces())
+
+    # Remove vertices that are no longer used after face removal.
+    combined_mesh.remove_unreferenced_vertices()
 
     # Step 13: Ensure the mesh is watertight
     if not combined_mesh.is_watertight:
         print("Mesh is not watertight. Attempting to fill holes.")
-        combined_mesh.fill_holes()
+        try:
+            combined_mesh.fill_holes()
+        except Exception as e:
+            print(f"Failed to fill holes: {e}")
 
     # Step 14: Final processing to clean up the mesh
     try:
+        # process(validate=True) checks for watertightness and fixes normals.
         combined_mesh.process(validate=True)
     except Exception as e:
         print(f"Error during mesh processing: {e}")
-        # Optionally, skip processing or handle differently
         pass
 
     return combined_mesh
